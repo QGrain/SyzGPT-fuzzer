@@ -119,7 +119,7 @@ endif
 	presubmit_arch_executor presubmit_dashboard presubmit_race presubmit_old
 
 all: host target
-host: manager runtest repro mutate prog2c db upgrade
+host: manager runtest repro mutate prog2c db upgrade validator
 target: fuzzer execprog stress executor
 
 executor: descriptions
@@ -197,6 +197,9 @@ stress: descriptions
 
 db: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-db github.com/google/syzkaller/tools/syz-db
+
+validator: descriptions
+	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-validator github.com/google/syzkaller/tools/syz-validator
 
 upgrade: descriptions
 	GOOS=$(HOSTOS) GOARCH=$(HOSTARCH) $(HOSTGO) build $(GOHOSTFLAGS) -o ./bin/syz-upgrade github.com/google/syzkaller/tools/syz-upgrade

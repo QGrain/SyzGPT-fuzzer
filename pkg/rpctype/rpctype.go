@@ -14,12 +14,13 @@ import (
 )
 
 type Input struct {
-	Call     string
-	Prog     []byte
-	Signal   signal.Serial
-	Cover    []uint32
-	CallID   int // seq number of call in the prog to which the item is related (-1 for extra)
-	RawCover []uint32
+	Call       string
+	Prog       []byte
+	Signal     signal.Serial
+	Cover      []uint32
+	CallID     int // seq number of call in the prog to which the item is related (-1 for extra)
+	RawCover   []uint32
+	CoverCalls map[string]struct{} // covered calls in the prog
 }
 
 type Candidate struct {

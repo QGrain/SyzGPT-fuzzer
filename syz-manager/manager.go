@@ -41,10 +41,27 @@ import (
 )
 
 var (
-	flagConfig = flag.String("config", "", "configuration file")
-	flagDebug  = flag.Bool("debug", false, "dump all VM output to console")
-	flagBench  = flag.String("bench", "", "write execution statistics into this file periodically")
+	flagConfig    = flag.String("config", "", "configuration file")
+	flagDebug     = flag.Bool("debug", false, "dump all VM output to console")
+	flagDump      = flag.String("dump", "", "dump inputCover to dir for programs added to corpus")
+	flagBench     = flag.String("bench", "", "write execution statistics into this file periodically")
+	flagEnrich    = flag.String("enrich", "", "directory of the external progs to enrich corpus periodically")
+	flagPeriod    = flag.String("period", "", "period of enriching the corpus with external progs")
+	flagStatCall  = flag.Bool("statcall", false, "stat covered syscalls and store at workdir/CoverCalls")
+	flagBackup    = flag.String("backup", "", "period of backuping the corpus, CoveredCalls and rawcover")
+	loadedSeeds   = make(map[string]struct{})
+	loadedSeedsMu sync.Mutex
+	enrichCnt     int
+	gCoverCalls   = make(map[string]struct{})
+	costT         time.Duration
+	costTMu       sync.Mutex
 )
+
+// TODOs:
+// get the cover for test cases in initial corpus and default seeds
+// add option for periodically back up corpus.db and CoveredCalls
+// add number of repro into bench log
+// add number of reachable test cases into bench log
 
 type Manager struct {
 	cfg            *mgrconfig.Config
@@ -257,8 +274,40 @@ func RunManager(cfg *mgrconfig.Config) {
 		}
 	}()
 
+	go func() {
+		if *flagEnrich != "" && *flagPeriod != "" {
+			// Parse the duration string
+			duration, err := time.ParseDuration(*flagPeriod)
+			if err != nil {
+				log.Logf(0, "error parsing duration: %v. Exit go func.", err)
+				return
+			}
+			for {
+				log.Logf(0, "[+] sleep with period: %v", duration)
+				time.Sleep(duration)
+				mgr.enrichCorpus()
+			}
+		}
+	}()
+
+	go func() {
+		if *flagStatCall {
+			for {
+				time.Sleep(time.Minute)
+				if len(mgr.targetEnabledSyscalls) != 0 {
+					mgr.dumpEnabledSyscalls()
+					break
+				}
+			}
+		}
+	}()
+
 	if *flagBench != "" {
 		mgr.initBench()
+	}
+
+	if *flagBackup != "" {
+		mgr.initBackup()
 	}
 
 	if mgr.dash != nil {
@@ -274,6 +323,55 @@ func RunManager(cfg *mgrconfig.Config) {
 		return
 	}
 	mgr.vmLoop()
+}
+
+func (mgr *Manager) initBackup() {
+	// check and create dump dir
+	backupDir := filepath.Join(mgr.cfg.Workdir, "backups")
+	_, err := os.Stat(backupDir)
+	if os.IsNotExist(err) {
+		// directory does not exist, create it
+		err = os.MkdirAll(backupDir, os.ModePerm)
+		if err != nil {
+			log.Logf(0, "[DEBUG] create dir %s error.", backupDir)
+			return
+		}
+	}
+	// Parse the duration string
+	duration, err := time.ParseDuration(*flagBackup)
+	if err != nil {
+		log.Logf(0, "error parsing duration: %v.", err)
+		return
+	}
+	backCnt := 0
+	go func() {
+		for {
+			time.Sleep(duration)
+			backCnt += 1
+			log.Logf(0, "[+] start the %v-th backup after sleep of duration: %v", backCnt, duration)
+			// add mutex lock for these backup files?
+			// backup corpus
+			srcCorpus := filepath.Join(mgr.cfg.Workdir, "corpus.db")
+			dstCorpus := filepath.Join(backupDir, fmt.Sprintf("corpus.db_%d_%s", backCnt, *flagBackup))
+			osutil.CopyFile(srcCorpus, dstCorpus)
+
+			// backup CoveredCalls
+			srcCoveredCalls := filepath.Join(mgr.cfg.Workdir, "CoveredCalls")
+			dstCoveredCalls := filepath.Join(backupDir, fmt.Sprintf("CoveredCalls_%d_%s", backCnt, *flagBackup))
+			osutil.CopyFile(srcCoveredCalls, dstCoveredCalls)
+
+			// backup rawcover
+			dstRawcover := filepath.Join(backupDir, fmt.Sprintf("rawcover_%d_%s", backCnt, *flagBackup))
+			// if _, err := osutil.RunCmd(5*time.Minute, "", "curl", "-X", "GET", fmt.Sprintf("%s/rawcover", mgr.cfg.HTTP), ">", dstRawcover); err != nil {
+			if outBytes, err := osutil.RunCmd(5*time.Minute, "", "curl", "-X", "GET", fmt.Sprintf("http://%s/rawcover", mgr.cfg.HTTP)); err != nil {
+				log.Logf(0, "[x] fail to curl rawcover: %v", err)
+			} else {
+				log.Logf(0, "[+] rawcover curl success")
+				osutil.WriteFile(dstRawcover, outBytes)
+			}
+			log.Logf(0, "[+] the %v-th backup finish", backCnt)
+		}
+	}()
 }
 
 func (mgr *Manager) initBench() {
@@ -295,6 +393,10 @@ func (mgr *Manager) initBench() {
 			vals["uptime"] = uint64(time.Since(mgr.firstConnect)) / 1e9
 			vals["fuzzing"] = uint64(mgr.fuzzingTime) / 1e9
 			vals["candidates"] = uint64(len(mgr.candidates))
+			vals["EnabledSyscalls"] = uint64(len(mgr.targetEnabledSyscalls))
+			vals["syscalls"] = uint64(len(gCoverCalls))
+			vals["EnrichCnt"] = uint64(enrichCnt)
+			vals["costT"] = uint64(costT) / 1e6
 			mgr.mu.Unlock()
 
 			data, err := json.MarshalIndent(vals, "", "  ")
@@ -587,6 +689,56 @@ func (pool *ResourcePool) TakeOne() *int {
 	return &ret[0]
 }
 
+func (mgr *Manager) enrichCorpus() {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	enrichDir := *flagEnrich
+	log.Logf(0, "[+] Start to enriching corpus, try to load progs from %v", enrichDir)
+	if osutil.IsExist(enrichDir) {
+		seeds, err := os.ReadDir(enrichDir)
+		if err != nil {
+			log.Fatalf("failed to read enrich dir: %v", err)
+		}
+		canShuffle := false
+		if len(mgr.candidates) == 0 {
+			canShuffle = true
+		}
+		for _, seed := range seeds {
+			loadedSeedsMu.Lock()
+			_, loaded := loadedSeeds[seed.Name()]
+			loadedSeedsMu.Unlock()
+
+			if loaded {
+				continue
+			}
+
+			data, err := os.ReadFile(filepath.Join(enrichDir, seed.Name()))
+			if err != nil {
+				log.Fatalf("failed to read enriched seed %v: %v", seed.Name(), err)
+			}
+
+			loadedSeedsMu.Lock()
+			loadedSeeds[seed.Name()] = struct{}{}
+			loadedSeedsMu.Unlock()
+
+			if mgr.loadProg(data, true, false) {
+				enrichCnt += 1
+			}
+		}
+		log.Logf(0, "%-24v: %v/%v", "enriched seeds", enrichCnt, len(seeds))
+
+		// shuffle or not?
+		if canShuffle {
+			log.Logf(0, "[+] Can shuffle")
+			mgr.candidates = append(mgr.candidates, mgr.candidates...)
+			shuffle := mgr.candidates[len(mgr.candidates)/2:]
+			rand.Shuffle(len(shuffle), func(i, j int) {
+				shuffle[i], shuffle[j] = shuffle[j], shuffle[i]
+			})
+		}
+	}
+}
+
 func (mgr *Manager) preloadCorpus() {
 	log.Logf(0, "loading corpus...")
 	corpusDB, err := db.Open(filepath.Join(mgr.cfg.Workdir, "corpus.db"), true)
@@ -642,6 +794,8 @@ func (mgr *Manager) loadCorpus() {
 		if !mgr.loadProg(rec.Val, minimized, smashed) {
 			mgr.corpusDB.Delete(key)
 			broken++
+		} else if *flagStatCall {
+			mgr.statCallFromByte(rec.Val)
 		}
 	}
 	mgr.fresh = len(mgr.corpusDB.Records) == 0
@@ -649,7 +803,9 @@ func (mgr *Manager) loadCorpus() {
 	log.Logf(0, "%-24v: %v (deleted %v broken)", "corpus", corpusSize, broken)
 
 	for _, seed := range mgr.seeds {
-		mgr.loadProg(seed, true, false)
+		if mgr.loadProg(seed, true, false) && *flagStatCall {
+			mgr.statCallFromByte(seed)
+		}
 	}
 	log.Logf(0, "%-24v: %v/%v", "seeds", len(mgr.candidates)-corpusSize, len(mgr.seeds))
 	mgr.seeds = nil
@@ -1357,6 +1513,97 @@ func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*pr
 	mgr.firstConnect = time.Now()
 }
 
+func (mgr *Manager) dumpCover(cov []uint32, dumpPath string) {
+	t0 := time.Now()
+	// create dump log
+	fDbg, err := os.OpenFile(filepath.Join(*flagDump, "dumpCover.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer fDbg.Close()
+
+	// dump pcs of rawcover
+	fDump, err := os.Create(dumpPath)
+	if err != nil {
+		fmt.Fprintf(fDbg, "[DEBUG] create cover dump file %s error.\n", dumpPath)
+		return
+	}
+	defer fDump.Close()
+
+	// use a loop to write each uint64 to the file
+	for _, pc := range cov {
+		// npc := uint64(0xffffffff)<<32 + uint64(pc)
+		_, err := fmt.Fprintf(fDump, "0x%x\n", cover.RestorePC(pc, 0xffffffff))
+		if err != nil {
+			return
+		}
+	}
+
+	fmt.Fprintf(fDbg, "[SUCCESS] RawCover data has been written to %s\n", dumpPath)
+	costTMu.Lock()
+	costT += time.Since(t0)
+	costTMu.Unlock()
+}
+
+func (mgr *Manager) dumpEnabledSyscalls() {
+	t0 := time.Now()
+	enabledCallPath := filepath.Join(mgr.cfg.Workdir, "EnabledCalls")
+	storeCallName(mgr.cfg.Sandbox, enabledCallPath)
+	for syscall := range mgr.targetEnabledSyscalls {
+		storeCallName(syscall.Name, enabledCallPath)
+	}
+	costTMu.Lock()
+	costT += time.Since(t0)
+	costTMu.Unlock()
+}
+
+func (mgr *Manager) statCallFromByte(progBytes []byte) {
+	t0 := time.Now()
+	p, _ := mgr.target.Deserialize(progBytes, prog.NonStrict)
+	coveredCallPath := filepath.Join(mgr.cfg.Workdir, "CoveredCalls")
+	for _, call := range p.Calls {
+		name := call.Meta.Name
+		if _, exist := gCoverCalls[name]; !exist {
+			gCoverCalls[name] = struct{}{}
+			// append to the local CoverCalls file, one name per line
+			storeCallName(name, coveredCallPath)
+		}
+	}
+	costTMu.Lock()
+	costT += time.Since(t0)
+	costTMu.Unlock()
+}
+
+func (mgr *Manager) statCallFromMap(coverCalls map[string]struct{}) {
+	t0 := time.Now()
+	coveredCallPath := filepath.Join(mgr.cfg.Workdir, "CoveredCalls")
+	for name := range coverCalls {
+		if _, exist := gCoverCalls[name]; !exist {
+			gCoverCalls[name] = struct{}{}
+			// append to the local CoverCalls file, one name per line
+			storeCallName(name, coveredCallPath)
+		}
+	}
+	costTMu.Lock()
+	costT += time.Since(t0)
+	costTMu.Unlock()
+}
+
+func storeCallName(name, filename string) {
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Logf(0, "[statCall] failed to create file: %v", err)
+		return
+	}
+	defer file.Close()
+
+	_, err = fmt.Fprintf(file, "%s\n", name)
+	if err != nil {
+		log.Logf(0, "[statCall] failed to write to file: %v", err)
+		return
+	}
+}
+
 func (mgr *Manager) newInput(inp rpctype.Input, sign signal.Signal) bool {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
@@ -1395,6 +1642,33 @@ func (mgr *Manager) newInput(inp rpctype.Input, sign signal.Signal) bool {
 			log.Errorf("failed to save corpus database: %v", err)
 		}
 	}
+
+	if *flagDump != "" {
+		dumpCoverDir := filepath.Join(*flagDump, "coverages")
+		dumpProgDir := filepath.Join(*flagDump, "programs")
+		// check and create dump dir
+		_, err := os.Stat(*flagDump)
+		if os.IsNotExist(err) {
+			// directory does not exist, create it
+			if err := os.MkdirAll(*flagDump, 0755); err != nil {
+				log.Fatalf("failed to creat dump dir at %v: %v", *flagDump, err)
+			}
+			os.MkdirAll(dumpCoverDir, 0755) // ignore error
+			os.MkdirAll(dumpProgDir, 0755)  // ignore error
+		}
+
+		// dump for coverage
+		dumpCoverPath := filepath.Join(dumpCoverDir, sig)
+		mgr.dumpCover(inp.Cover, dumpCoverPath)
+		// dump for prog, as corpus will be periodically minimized, which may loose some progs
+		dumpProgPath := filepath.Join(dumpProgDir, sig)
+		osutil.WriteFile(dumpProgPath, inp.Prog)
+	}
+
+	if *flagStatCall {
+		mgr.statCallFromMap(inp.CoverCalls)
+	}
+
 	return true
 }
 
