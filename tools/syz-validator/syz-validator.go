@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 	_ "github.com/google/syzkaller/sys"
 )
@@ -69,11 +70,17 @@ func main() {
 		}
 
 	case "dir":
-		if len(args) != 2 {
+		if len(args) != 2 && len(args) != 3 {
 			usage()
 		}
 		log.Printf("Start to verify the files in dir: %v", args[1])
-		checkPrograms(target, args[1])
+		var outDir string
+		if len(args) == 3 {
+			outDir = args[2]
+		} else {
+			outDir = ""
+		}
+		checkPrograms(target, args[1], outDir)
 	case "debug":
 		debug(target)
 	default:
@@ -86,7 +93,7 @@ func main() {
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: syz-validator -os <OS> -arch <ARCH> -log <log_path> [args...]\n")
 	fmt.Fprintf(os.Stderr, "       syz-validator file syzprog\n")
-	fmt.Fprintf(os.Stderr, "       syz-validator dir /dir/to/syzprogs\n")
+	fmt.Fprintf(os.Stderr, "       syz-validator dir /dir/to/syzprogs [out_dir]\n")
 	fmt.Fprintf(os.Stderr, "       syz-validator debug\n")
 	os.Exit(1)
 }
@@ -104,11 +111,23 @@ func checkProgram(target *prog.Target, data []byte) (bad bool) {
 	return false
 }
 
-func checkPrograms(target *prog.Target, dir string) (badCnt int32) {
+func checkPrograms(target *prog.Target, dir, outDir string) (badCnt int32) {
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		log.Fatalf("failed to read dir: %v", err)
 		return -1
+	}
+
+	if outDir != "" {
+		_, err = os.Stat(outDir)
+		if os.IsNotExist(err) {
+			// directory does not exist, create it
+			err = os.MkdirAll(outDir, 0755)
+			if err != nil {
+				log.Printf("[DEBUG] create dir %s error: %v", outDir, err)
+				return
+			}
+		}
 	}
 
 	badCnt = 0
@@ -122,12 +141,14 @@ func checkPrograms(target *prog.Target, dir string) (badCnt int32) {
 			if bad {
 				badCnt += 1
 				log.Printf("%v is invalid!", file.Name())
-			} /*else {
-				log.Printf("%v is valid!", file.Name())
-			}*/
+			} else if outDir != "" {
+				outFile := filepath.Join(outDir, file.Name())
+				// log.Printf("%v is valid!", file.Name())
+				osutil.WriteFile(outFile, data)
+			}
 		}
 	}
-	log.Printf("Invalid syzprogram %v / %v", badCnt, len(files))
+	log.Printf("Invalid programs %v / %v", badCnt, len(files))
 	return badCnt
 }
 
@@ -146,8 +167,8 @@ func debug(target *prog.Target) {
 	}
 	defer f2.Close()
 
-	var call_map map[string]int32
-	call_map = make(map[string]int32)
+	// var call_map map[string]int32
+	call_map := make(map[string]int32)
 	for i, c := range target.Syscalls {
 		c.ID = i
 		r := ""
