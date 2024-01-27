@@ -49,6 +49,7 @@ var (
 	flagPeriod    = flag.String("period", "", "period of enriching the corpus with external progs")
 	flagStatCall  = flag.Bool("statcall", false, "stat covered syscalls and store at workdir/CoverCalls")
 	flagBackup    = flag.String("backup", "", "period of backuping the corpus, CoveredCalls and rawcover")
+	flagRepair    = flag.Bool("repair", false, "specify to enable repairing programs in generated_corpus")
 	loadedSeeds   = make(map[string]struct{})
 	loadedSeedsMu sync.Mutex
 	enrichCnt     int
@@ -283,8 +284,11 @@ func RunManager(cfg *mgrconfig.Config) {
 				return
 			}
 			for {
-				log.Logf(0, "[+] sleep with period: %v", duration)
+				log.Logf(0, "[+] enrichCorpus sleep with period: %v to go", duration)
 				time.Sleep(duration)
+				if *flagRepair {
+					mgr.repairCorpus()
+				}
 				mgr.enrichCorpus()
 			}
 		}
@@ -689,11 +693,21 @@ func (pool *ResourcePool) TakeOne() *int {
 	return &ret[0]
 }
 
+func (mgr *Manager) repairCorpus() {
+	enrichDir := *flagEnrich
+	log.Logf(0, "[+] Start to repair corpus %v", enrichDir)
+	repairBin := filepath.Join(mgr.cfg.Syzkaller, "bin", "syz-repair")
+	if _, err := osutil.RunCmd(2*time.Minute, "", repairBin, enrichDir, enrichDir); err != nil {
+		log.Logf(0, "[x] fail to syz-repair %v: %v", enrichDir, err)
+	}
+	log.Logf(0, "[+] Success to repair corpus %v", enrichDir)
+}
+
 func (mgr *Manager) enrichCorpus() {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
 	enrichDir := *flagEnrich
-	log.Logf(0, "[+] Start to enriching corpus, try to load progs from %v", enrichDir)
+	log.Logf(0, "[+] Start to enrich corpus, try to load progs from %v", enrichDir)
 	if osutil.IsExist(enrichDir) {
 		seeds, err := os.ReadDir(enrichDir)
 		if err != nil {
