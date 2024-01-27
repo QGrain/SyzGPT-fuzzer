@@ -4,6 +4,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -62,6 +63,11 @@ func main() {
 			usage()
 		}
 		unpack(args[1], args[2])
+	case "parse":
+		if len(args) != 3 {
+			usage()
+		}
+		parse(args[1], args[2])
 	case "merge":
 		if len(args) < 3 {
 			usage()
@@ -76,6 +82,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "usage:\n")
 	fmt.Fprintf(os.Stderr, "  syz-db pack dir corpus.db\n")
 	fmt.Fprintf(os.Stderr, "  syz-db unpack corpus.db dir\n")
+	fmt.Fprintf(os.Stderr, "  syz-db parse corpus.db dir\n")
 	fmt.Fprintf(os.Stderr, "  syz-db merge dst-corpus.db add-corpus.db* add-prog*\n")
 	fmt.Fprintf(os.Stderr, "  syz-db bench corpus.db\n")
 	os.Exit(1)
@@ -137,6 +144,105 @@ func unpack(file, dir string) {
 			tool.Failf("failed to output file: %v", err)
 		}
 	}
+}
+
+func parse(file, dir string) {
+	// workDir := filepath.Dir(file)
+	workDir := filepath.Dir(dir)
+	var target *prog.Target
+	target, err := prog.GetTarget("linux", "amd64")
+	if err != nil {
+		tool.Failf("[syz-db] failed to find target: %v", err)
+	}
+	progLenThreshold := 1000
+
+	// preload the stuffs
+	db, err := db.Open(file, false)
+	if err != nil {
+		tool.Failf("[syz-db] failed to open database: %v", err)
+	}
+
+	if !osutil.IsExist(dir) {
+		osutil.MkdirAll(dir)
+	} else {
+		fmt.Fprintf(os.Stderr, "[syz-db] dir already exist: %v\n", dir)
+	}
+	seeds, err := os.ReadDir(dir)
+	if err != nil {
+		tool.Failf("[syz-db] failed to read unpack corpus dir: %v", err)
+	}
+	existSeedNames := make(map[string]struct{})
+	for _, seed := range seeds {
+		existSeedNames[seed.Name()] = struct{}{}
+	}
+
+	// load reverseIndex, if not exist then returen map[string][]string
+	reverseIndexPath := filepath.Join(workDir, "reverse_index.json")
+	reverseIndex := loadReverseIndex(reverseIndexPath)
+
+	for key, rec := range db.Records {
+		fname := filepath.Join(dir, key)
+		if rec.Seq != 0 {
+			fname += fmt.Sprintf("-%v", rec.Seq)
+			key += fmt.Sprintf("-%v", rec.Seq)
+		}
+		// new seed unpack from corpus, do something for it
+		if _, exist := existSeedNames[key]; !exist {
+			// fmt.Fprintf(os.Stderr, "new seed unpack from corpus: %v\n", key)
+			if err := osutil.WriteFile(fname, rec.Val); err != nil {
+				tool.Failf("[syz-db] failed to output file: %v", err)
+			}
+			// skip the progs with len larger than threshold
+			if len(rec.Val) >= progLenThreshold {
+				continue
+			}
+			// complete reverseIndex
+			p, err := target.Deserialize(rec.Val, prog.NonStrict)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[syz-db] failed to deserialize %v for building reverseIndex: %v. continue.\n", fname, err)
+				continue
+			}
+			for _, call := range p.Calls {
+				name := call.Meta.Name
+				_, exist := reverseIndex[name]
+				if !exist {
+					var blank []string
+					reverseIndex[name] = append(blank, fname)
+				} else {
+					reverseIndex[name] = append(reverseIndex[name], fname)
+				}
+			}
+		}
+	}
+	// save the reverseIndex
+	if err := saveReverseIndex(reverseIndex, reverseIndexPath); err != nil {
+		tool.Failf("[syz-db] failed to save reverseIndex: %v", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "[syz-db] success to save reverseIndex: %v\n", reverseIndexPath)
+	}
+}
+
+// loadReverseIndex loads the reverse index from a file.
+func loadReverseIndex(file string) map[string][]string {
+	reverseIndex := make(map[string][]string)
+	if osutil.IsExist(file) {
+		fp, _ := os.OpenFile(file, os.O_CREATE|os.O_RDWR, 0644)
+		defer fp.Close()
+		decoder := json.NewDecoder(fp)
+		if err := decoder.Decode(&reverseIndex); err != nil {
+			return reverseIndex
+		}
+	}
+	return reverseIndex
+}
+
+// saveReverseIndex saves the reverse index to a file.
+func saveReverseIndex(reverseIndex map[string][]string, file string) error {
+	fp, _ := os.OpenFile(file, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
+	defer fp.Close()
+	encoder := json.NewEncoder(fp)
+	err := encoder.Encode(reverseIndex)
+	return err
 }
 
 func merge(file string, adds []string, target *prog.Target) {
