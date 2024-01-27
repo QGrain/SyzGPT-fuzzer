@@ -28,3 +28,6 @@ dashboard/app/.gcloudignore
 
 # vscode
 .vscode
+
+# benchdir
+benchdir/
