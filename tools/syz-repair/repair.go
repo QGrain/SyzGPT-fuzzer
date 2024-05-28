@@ -72,7 +72,6 @@ func main() {
 
 	dirMode := rpr.dirMode
 
-	var err error
 	if dirMode {
 		// check and repair a directory of programs
 		// errTypes := rpr.analyzeErrorDir(inputPath)
@@ -92,18 +91,7 @@ func main() {
 		fmt.Printf("\n%d/%d are valid program, rate = %.2f%%\n\n", validCnt, totalCnt, float64(validCnt)/float64(totalCnt)*100)
 	} else {
 		// check and repair one program
-		err = rpr.checkProgram(args[0])
-		re := regexp.MustCompile(`unknown syscall (\S+)`)
-		if err != nil {
-			log.Printf("%v", err)
-			match := re.FindStringSubmatch(err.Error())
-			if len(match) > 1 {
-				syscallName := match[1]
-				fmt.Printf("match unknown syscall: %s\n", syscallName)
-			} else {
-				fmt.Println("Not found match")
-			}
-		}
+		rpr.repairProgFile(inputPath, outputPath)
 	}
 
 	fmt.Printf("[%v] Execution done\n", rpr.timeElapse())
@@ -144,7 +132,7 @@ func (rpr *repairer) init(OS, Arch, inputPath, outputPath string) {
 		}
 	}
 	outputInfo, _ = os.Stat(outputPath)
-	if rpr.dirMode && outputInfo.IsDir() == false {
+	if rpr.dirMode && !outputInfo.IsDir() {
 		log.Fatalf("output should also be a dir when input is dir")
 	}
 
@@ -181,6 +169,19 @@ func (rpr *repairer) timeElapse() time.Duration {
 
 func (rpr *repairer) getCurTargetCall(filename string) string {
 	return rpr.genHistoryRev[filename]
+}
+
+func (rpr *repairer) repairProgFile(inFile, outFile string) {
+	repaLines := rpr.repairProgram(inFile)
+	repaData := lines2Data(repaLines)
+	err := rpr.checkProgramData(repaData)
+	if err == nil {
+		fmt.Printf("[%v] Repair success!\n", rpr.timeElapse())
+	} else {
+		fmt.Printf("[%v] Repair fail with err: %v\n", rpr.timeElapse(), err)
+	}
+	writeProg(repaLines, outFile)
+	fmt.Printf("[%v] rpr.repairProgFile done\n", rpr.timeElapse())
 }
 
 func (rpr *repairer) repairProgDir(inDir, outDir string) {
@@ -383,7 +384,7 @@ func (rpr *repairer) repairSyscall(lines []string, errName string) (repairedLine
 	var syscallName string
 	if len(match) > 1 {
 		syscallName = match[1]
-		// fmt.Printf("match unknown syscall: %s\n", syscallName)
+		// fmt.Printf("[DEBUG] match unknown syscall: %s\n", syscallName)
 	} else {
 		fmt.Printf("[%v] rpr.repairSyscall failed to match unknown syscall in %s\n", rpr.timeElapse(), errName)
 		return lines

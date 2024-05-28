@@ -94,7 +94,10 @@ func magnitude(tf map[string]float64) float64 {
 }
 
 // Function to calculate cosine similarity. The more similar, the more close to 1
+// Use lower case
 func cosineSimilarity(str1, str2 string) float64 {
+	str1 = strings.ToLower(str1)
+	str2 = strings.ToLower(str2)
 	s1 := strings.ReplaceAll(str1, "$", " ")
 	s1 = strings.ReplaceAll(s1, "_", " ")
 	s2 := strings.ReplaceAll(str2, "$", " ")
