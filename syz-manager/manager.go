@@ -163,6 +163,7 @@ type Crash struct {
 }
 
 func main() {
+	printLogo()
 	if prog.GitRevision == "" {
 		log.Fatalf("bad syz-manager build: build with make, run bin/syz-manager")
 	}
@@ -177,6 +178,21 @@ func main() {
 		log.SetName(cfg.Name)
 	}
 	RunManager(cfg)
+}
+
+func printLogo() {
+	// print logo for SyzGPT-fuzzer
+	logo := `
+  ____             ____ ____ _____      __                        
+ / ___| _   _ ____/ ___|  _ \_   _|    / _|_   _ ___________ _ __ 
+ \___ \| | | |_  / |  _| |_) || |_____| |_| | | |_  /_  / _ \ '__|
+  ___) | |_| |/ /| |_| |  __/ | |_____|  _| |_| |/ / / /  __/ |   
+ |____/ \__, /___|\____|_|    |_|     |_|  \__,_/___/___\___|_|   
+        |___/                                                     
+		
+ SyzGPT-fuzzer v1.0.0
+`
+	fmt.Println(logo)
 }
 
 func RunManager(cfg *mgrconfig.Config) {
