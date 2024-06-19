@@ -10,7 +10,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +40,14 @@ var (
 	flagHints     = flag.Bool("hints", false, "do a hints-generation run")
 	flagEnable    = flag.String("enable", "none", "enable only listed additional features")
 	flagDisable   = flag.String("disable", "none", "enable all additional features except listed")
+
+	// added by SyzGPT
+	flagSemantic   = flag.Bool("semantic", false, "semantic mode: compare the coverage of prog and prog.rev")
+	flagProgDir    = flag.String("progdir", "", "specify a dir that includes progs to be calc")
+	flagNoDumpCall = flag.Bool("nodumpcall", false, "do not dump call level coverage to save space")
+	flagMaxRetry   = flag.Int("retry", 10, "max retry for execution failure (default 10, use 2 for semantic mode)")
+	// end
+
 	// The following flag is only kept to let syzkaller remain compatible with older execprog versions.
 	// In order to test incoming patches or perform bug bisection, syz-ci must use the exact syzkaller
 	// version that detected the bug (as descriptions and syntax could've already been changed), and
@@ -52,16 +63,31 @@ var (
 	flagCollide = flag.Bool("collide", false, "(DEPRECATED) collide syscalls to provoke data races")
 )
 
+// added by SyzGPT
+// Global Map, storing coverage of [origin_prog, reverse_prog]
+var CoverRecord map[string][3]int //cov0_of_origin, cov1_of_reverse, prog_line_num
+var CoverRecordMutex sync.Mutex
+var ExecFailCnt int
+
+// end
+
 func main() {
+	CoverRecord = make(map[string][3]int)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: execprog [flags] file-with-programs-or-corpus.db+\n")
 		flag.PrintDefaults()
 		csource.PrintAvailableFeaturesFlags()
 	}
 	defer tool.Init()()
-	if len(flag.Args()) == 0 {
+	if *flagProgDir == "" && len(flag.Args()) == 0 {
 		flag.Usage()
 		os.Exit(1)
+	}
+	if *flagCoverFile != "" {
+		covDir, _ := filepath.Split(*flagCoverFile)
+		if covDir != "" {
+			os.MkdirAll(covDir, 0644)
+		}
 	}
 	featuresFlags, err := csource.ParseFeaturesFlags(*flagEnable, *flagDisable, true)
 	if err != nil {
@@ -72,10 +98,59 @@ func main() {
 	if err != nil {
 		log.Fatalf("%v", err)
 	}
-	progs := loadPrograms(target, flag.Args())
-	if len(progs) == 0 {
-		return
+	// added by SyzGPT
+	var progs []*prog.Prog
+	var reverseProgs []*prog.Prog
+	var filePathList []string
+	var reverseFilePathList []string
+	var fileNameList []string
+	var reverseFileNameList []string
+	if *flagProgDir != "" {
+		// 从文件夹load文件
+		files, errdir := os.ReadDir(*flagProgDir)
+		if errdir != nil {
+			log.Fatalf("%v", err)
+		}
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			if *flagSemantic {
+				if strings.HasSuffix(file.Name(), ".rev") {
+					reverseFilePathList = append(reverseFilePathList, filepath.Join(*flagProgDir, file.Name()))
+					reverseFileNameList = append(reverseFileNameList, file.Name())
+					index := strings.LastIndex(file.Name(), ".rev")
+					stripName := file.Name()[:index]
+					fileNameList = append(fileNameList, stripName)
+					filePathList = append(filePathList, filepath.Join(*flagProgDir, stripName))
+				}
+			} else {
+				fileNameList = append(fileNameList, file.Name())
+				filePathList = append(filePathList, filepath.Join(*flagProgDir, file.Name()))
+			}
+		}
+	} else {
+		// 从命令行参数读取文件
+		for _, filePath := range flag.Args() {
+			fileName := filepath.Base(filePath)
+			fileNameList = append(fileNameList, fileName)
+			filePathList = append(filePathList, filePath)
+			if *flagSemantic {
+				reverseFilePath := filePath + ".rev"
+				reverseFilePathList = append(reverseFilePathList, reverseFilePath)
+				reverseFileNameList = append(reverseFileNameList, filepath.Base(reverseFilePath))
+			}
+		}
 	}
+	progs = loadPrograms(target, filePathList)
+	reverseProgs = loadPrograms(target, reverseFilePathList)
+	// end
+	if len(progs) == 0 && len(reverseProgs) == 0 {
+		return
+	} else {
+		log.Logf(0, "[success] load %d progs and %d rev_progs", len(progs), len(reverseProgs))
+	}
+
 	features, err := host.Check(target)
 	if err != nil {
 		log.Fatalf("%v", err)
@@ -104,6 +179,7 @@ func main() {
 	}
 	ctx := &Context{
 		progs:    progs,
+		progFns:  fileNameList,
 		config:   config,
 		execOpts: execOpts,
 		gate:     ipc.NewGate(2**flagProcs, gateCallback),
@@ -116,15 +192,152 @@ func main() {
 		pid := p
 		go func() {
 			defer wg.Done()
-			ctx.run(pid)
+			ctx.run(pid, 0)
 		}()
 	}
 	osutil.HandleInterrupts(ctx.shutdown)
 	wg.Wait()
+
+	// added by SyzGPT
+	if *flagSemantic {
+		// added by SyzGPT
+		revCtx := &Context{
+			progs:    reverseProgs,
+			progFns:  reverseFileNameList,
+			config:   config,
+			execOpts: execOpts,
+			gate:     ipc.NewGate(2**flagProcs, gateCallback),
+			shutdown: make(chan struct{}),
+			repeat:   *flagRepeat,
+		}
+		// end
+		var revWg sync.WaitGroup
+		revWg.Add(*flagProcs)
+		for p := 0; p < *flagProcs; p++ {
+			pid := p
+			go func() {
+				defer revWg.Done()
+				revCtx.run(pid, 1)
+			}()
+		}
+		osutil.HandleInterrupts(revCtx.shutdown)
+		revWg.Wait()
+	}
+	// end
+
+	// added by SyzGPT
+	if *flagSemantic && *flagCoverFile != "" {
+		CoverRecord_OutputFile := fmt.Sprintf("%s_Total_CoverRecord", *flagCoverFile)
+		err := saveToFile(CoverRecord_OutputFile)
+		if err != nil {
+			log.Logf(0, "Failed to save CoverRecord.")
+			log.Fatal(err)
+			return
+		}
+
+		log.Logf(0, "CoverRecord saved successfully.")
+	}
+	// end
 }
+
+// added by SyzGPT
+// Save CoverRecord to file
+func saveToFile(fileName string) error {
+	file, err := os.Create(fileName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// general cover info
+	total_cover := 0
+	win_cover := 0
+	equal_cover := 0
+	lose_cover := 0
+
+	//make cover info more specific
+	OneLineProg_total := 0
+	OneLineProg_win := 0
+	OneLineProg_equal := 0
+	OneLineProg_lose := 0
+
+	for key, value := range CoverRecord {
+		cov0 := value[0]
+		cov1 := value[1]
+		lineNum := value[2]
+
+		total_cover += 1
+		if lineNum == 1 {
+			OneLineProg_total += 1
+		}
+		if cov0 > cov1 {
+			win_cover += 1
+			if lineNum == 1 {
+				OneLineProg_win += 1
+			}
+		} else if cov0 == cov1 {
+			equal_cover += 1
+			if lineNum == 1 {
+				OneLineProg_equal += 1
+			}
+		} else {
+			lose_cover += 1
+			if lineNum == 1 {
+				OneLineProg_lose += 1
+			}
+		}
+
+		line := key + "," + strconv.Itoa(cov0) + "," + strconv.Itoa(cov1) + "," + strconv.Itoa(lineNum) + "\n"
+		_, err := file.WriteString(line)
+		if err != nil {
+			return err
+		}
+	}
+	// win_rate := float64(win_cover) / float64(total_cover)
+	// percentage := win_rate * 100
+	// format_percent := fmt.Sprintf("%.2f%%", percentage)
+	// line := "Win Rate:" + strconv.Itoa(win_cover) + "/" + strconv.Itoa(total_cover) + "=" + format_percent
+	line := "Result info:\n" +
+		"Total Progs: " + strconv.Itoa(total_cover) + "\n" +
+		"Total win: " + strconv.Itoa(win_cover) + "\n" +
+		"Total equal: " + strconv.Itoa(equal_cover) + "\n" +
+		"Total lose: " + strconv.Itoa(lose_cover) + "\n\n" +
+		"One-line Progs:" + strconv.Itoa(OneLineProg_total) + "\n" +
+		"One-line win:" + strconv.Itoa(OneLineProg_win) + "\n" +
+		"One-line equal:" + strconv.Itoa(OneLineProg_equal) + "\n" +
+		"One-line lose:" + strconv.Itoa(OneLineProg_lose) + "\n" +
+		"Execution Fails:" + strconv.Itoa(ExecFailCnt) + "\n"
+	_, err_last := file.WriteString(line)
+	if err_last != nil {
+		return err_last
+	}
+	return nil
+}
+
+func setCoverRecord(fileName string, value1, value2, lineNum int) {
+	CoverRecordMutex.Lock()
+	defer CoverRecordMutex.Unlock()
+
+	CoverRecord[fileName] = [3]int{value1, value2, lineNum}
+}
+
+func getCoverRecord(fileName string) (bool, int, int) {
+	CoverRecordMutex.Lock()
+	defer CoverRecordMutex.Unlock()
+
+	values, ok := CoverRecord[fileName]
+	if ok {
+		return ok, values[0], values[1]
+	}
+
+	return ok, 0, 0
+}
+
+// end
 
 type Context struct {
 	progs     []*prog.Prog
+	progFns   []string
 	config    *ipc.Config
 	execOpts  *ipc.ExecOpts
 	gate      *ipc.Gate
@@ -136,7 +349,7 @@ type Context struct {
 	lastPrint time.Time
 }
 
-func (ctx *Context) run(pid int) {
+func (ctx *Context) run(pid int, covType int) {
 	env, err := ipc.MakeEnv(ctx.config, pid)
 	if err != nil {
 		log.Fatalf("failed to create ipc env: %v", err)
@@ -153,11 +366,11 @@ func (ctx *Context) run(pid int) {
 			return
 		}
 		entry := ctx.progs[idx%len(ctx.progs)]
-		ctx.execute(pid, env, entry, idx)
+		ctx.execute(pid, env, entry, idx, covType)
 	}
 }
 
-func (ctx *Context) execute(pid int, env *ipc.Env, p *prog.Prog, progIndex int) {
+func (ctx *Context) execute(pid int, env *ipc.Env, p *prog.Prog, progIndex int, covType int) {
 	// Limit concurrency window.
 	ticket := ctx.gate.Enter()
 	defer ctx.gate.Leave(ticket)
@@ -170,8 +383,15 @@ func (ctx *Context) execute(pid int, env *ipc.Env, p *prog.Prog, progIndex int) 
 	for try := 0; ; try++ {
 		output, info, hanged, err := env.Exec(callOpts, p)
 		if err != nil && err != prog.ErrExecBufferTooSmall {
-			if try > 10 {
-				log.Fatalf("executor failed %v times: %v\n%s", try, err, output)
+			if try > *flagMaxRetry {
+				if *flagProgDir != "" {
+					log.Logf(0, "executor failed %v times: %v\n%s", try, err, output)
+					log.Logf(0, "[semantic dump mode] the %d prog failed, skip it", progIndex)
+					ExecFailCnt += 1
+					break
+				} else {
+					log.Fatalf("executor failed %v times: %v\n%s", try, err, output)
+				}
 			}
 			// Don't print err/output in this case as it may contain "SYZFAIL" and we want to fail yet.
 			log.Logf(1, "executor failed, retrying")
@@ -187,8 +407,14 @@ func (ctx *Context) execute(pid int, env *ipc.Env, p *prog.Prog, progIndex int) 
 				ctx.printHints(p, info)
 			}
 			if *flagCoverFile != "" {
-				covFile := fmt.Sprintf("%s_prog%d", *flagCoverFile, progIndex)
-				ctx.dumpCoverage(covFile, info)
+				var covFile string
+				if *flagProgDir != "" {
+					covFile = fmt.Sprintf("%s_%s", *flagCoverFile, ctx.progFns[progIndex%len(ctx.progFns)])
+				} else {
+					covFile = fmt.Sprintf("%s_prog%d", *flagCoverFile, progIndex)
+				}
+				// log.Logf(0, "[debug] dumpCoverage for %s", covFile)
+				ctx.dumpCoverage(covFile, info, covType)
 			}
 		} else {
 			log.Logf(1, "RESULT: no calls executed")
@@ -265,11 +491,62 @@ func (ctx *Context) dumpCallCoverage(coverFile string, info *ipc.CallInfo) {
 	}
 }
 
-func (ctx *Context) dumpCoverage(coverFile string, info *ipc.ProgInfo) {
+func (ctx *Context) dumpCoverage(coverFile string, info *ipc.ProgInfo, covType int) {
 	for i, inf := range info.Calls {
 		log.Logf(0, "call #%v: signal %v, coverage %v", i, len(inf.Signal), len(inf.Cover))
-		ctx.dumpCallCoverage(fmt.Sprintf("%v.%v", coverFile, i), &inf)
+		if !*flagNoDumpCall && !*flagSemantic {
+			ctx.dumpCallCoverage(fmt.Sprintf("%v.%v", coverFile, i), &inf)
+		}
 	}
+
+	// added by SyzGPT
+	totalMap := make(map[string]int)
+	covNum := 0
+	lineNum := 0
+	for _, inf := range info.Calls {
+		lineNum += 1
+		for _, pc := range inf.Cover {
+			newPC := fmt.Sprintf("0x%x", cover.RestorePC(pc, 0xffffffff))
+			if _, ok := totalMap[newPC]; !ok {
+				totalMap[newPC] = 1
+				covNum += 1
+			}
+		}
+	}
+
+	// record pc coverage to global map
+	recordKey := strings.TrimSuffix(coverFile, ".rev")
+	ok, cov0, cov1 := getCoverRecord(recordKey)
+	if covType == 0 {
+		if ok {
+			log.Logf(0, "Cover map error! Repeated prog. %s", recordKey)
+		} else {
+			cov0 = covNum
+			setCoverRecord(recordKey, cov0, cov1, lineNum)
+		}
+	} else {
+		if ok {
+			cov1 = covNum
+			setCoverRecord(recordKey, cov0, cov1, lineNum)
+		} else {
+			log.Logf(0, "Cover map error! Non-existed origin prog. %s", recordKey)
+		}
+	}
+
+	// make a buffer to output
+	buf := new(bytes.Buffer)
+	for pc := range totalMap {
+		fmt.Fprintf(buf, "%s\n", pc)
+	}
+
+	// write cover pcs to file
+	err := osutil.WriteFile(coverFile+".total", buf.Bytes())
+	if err != nil {
+		log.Fatalf("SyzGPT failed to write total coverage file: %v", err)
+	}
+	log.Logf(0, "[debug] total coverage done for the %d prog %s", ctx.pos, coverFile)
+	// end
+
 	log.Logf(0, "extra: signal %v, coverage %v", len(info.Extra.Signal), len(info.Extra.Cover))
 	ctx.dumpCallCoverage(fmt.Sprintf("%v.extra", coverFile), &info.Extra)
 }

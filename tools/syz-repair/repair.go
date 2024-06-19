@@ -34,9 +34,10 @@ type repairer struct {
 func main() {
 	start := time.Now()
 	var (
-		flagOS   = flag.String("os", "linux", "target OS")
-		flagArch = flag.String("arch", "amd64", "target arch")
-		flagLog  = flag.String("log", "", "log file")
+		flagOS     = flag.String("os", "linux", "target OS")
+		flagArch   = flag.String("arch", "amd64", "target arch")
+		flagLog    = flag.String("log", "", "log file")
+		flagGenHis = flag.String("history", "", "path to generation_history.json")
 	)
 	flag.Parse()
 	args := flag.Args()
@@ -58,11 +59,15 @@ func main() {
 		log.SetOutput(multiOut)
 	}
 
+	if *flagGenHis != "" {
+		// load generation_history.json
+	}
+
 	fmt.Printf("[%v] preprocess done\n", time.Since(start))
 
 	var target *prog.Target
-	var rpr *repairer
-	rpr = &repairer{
+	// var rpr *repairer
+	rpr := &repairer{
 		target:        target,
 		callMap:       make(map[string][]string),
 		genHistoryRev: make(map[string]string),
@@ -447,6 +452,9 @@ func (rpr *repairer) checkProgram(file string) (err error) {
 }
 
 func (rpr *repairer) checkProgramData(data []byte) (err error) {
+	if len(data) == 0 {
+		return errors.New("Program is blank")
+	}
 	p, err := rpr.target.Deserialize(data, prog.NonStrict)
 	if err != nil {
 		return err

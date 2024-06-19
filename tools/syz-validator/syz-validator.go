@@ -99,6 +99,10 @@ func usage() {
 }
 
 func checkProgram(target *prog.Target, data []byte) (bad bool) {
+	if len(data) == 0 {
+		log.Printf("Program is blank")
+		return true
+	}
 	p, err := target.Deserialize(data, prog.NonStrict)
 	if err != nil {
 		log.Printf("Deserialize error: %v", err)
@@ -148,7 +152,7 @@ func checkPrograms(target *prog.Target, dir, outDir string) (badCnt int32) {
 			}
 		}
 	}
-	log.Printf("Invalid programs %v / %v", badCnt, len(files))
+	log.Printf("Invalid programs %v / %v, Syntax Valid Rate: %.2f%%", badCnt, len(files), (float64(len(files)-int(badCnt)) / float64(len(files)) * 100))
 	return badCnt
 }
 
