@@ -389,6 +389,11 @@ func (mgr *Manager) initBackup() {
 				log.Logf(0, "[+] rawcover curl success")
 				osutil.WriteFile(dstRawcover, outBytes)
 			}
+			// backup crashes
+			srcCrashDir := filepath.Join(mgr.cfg.Workdir, "crashes")
+			dstCrashDir := filepath.Join(backupDir, fmt.Sprintf("crashes_%d_%s", backCnt, *flagBackup))
+			osutil.CopyDirRecursively(srcCrashDir, dstCrashDir)
+
 			log.Logf(0, "[+] the %v-th backup finish", backCnt)
 		}
 	}()
@@ -1578,7 +1583,7 @@ func (mgr *Manager) dumpCover(cov []uint32, dumpPath string) {
 func (mgr *Manager) dumpEnabledSyscalls() {
 	t0 := time.Now()
 	enabledCallPath := filepath.Join(mgr.cfg.Workdir, "EnabledCalls")
-	storeCallName(mgr.cfg.Sandbox, enabledCallPath)
+	// storeCallName(mgr.cfg.Sandbox, enabledCallPath)
 	for syscall := range mgr.targetEnabledSyscalls {
 		storeCallName(syscall.Name, enabledCallPath)
 	}
