@@ -239,6 +239,7 @@ func RunManager(cfg *mgrconfig.Config) {
 		saturatedCalls:   make(map[string]bool),
 	}
 
+	mgr.recordCmd()
 	mgr.preloadCorpus()
 	mgr.initStats() // Initializes prometheus variables.
 	mgr.initHTTP()  // Creates HTTP server.
@@ -343,6 +344,17 @@ func RunManager(cfg *mgrconfig.Config) {
 		return
 	}
 	mgr.vmLoop()
+}
+
+func (mgr *Manager) recordCmd() {
+	cmdPath := filepath.Join(mgr.cfg.Workdir, "cmdline")
+	var cmd string
+	for _, arg := range os.Args {
+		cmd += fmt.Sprintf("%s ", arg)
+	}
+	timeStr := time.Now().Format("2006/01/02 15:04:05")
+	cmdRecord := fmt.Sprintf("%s [cmdline] %s\n", timeStr, cmd)
+	os.WriteFile(cmdPath, []byte(cmdRecord), 0644)
 }
 
 func (mgr *Manager) initBackup() {
