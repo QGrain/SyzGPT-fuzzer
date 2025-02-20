@@ -300,9 +300,19 @@ func RunManager(cfg *mgrconfig.Config) {
 				log.Logf(0, "error parsing duration: %v. Exit go func.", err)
 				return
 			}
+			seeEndFlag := 0
 			for {
 				log.Logf(0, "[+] enrichCorpus sleep with period: %v to go", duration)
 				time.Sleep(duration)
+				// check the EndFlag: GENERATION_END
+				if _, err := os.Stat(filepath.Join(mgr.cfg.Workdir, "GENERATION_END")); err == nil {
+					seeEndFlag++
+					log.Logf(0, "[+] GENERATION_END flag detected. seeEndFlag: %d", seeEndFlag)
+				}
+				if seeEndFlag == 2 {
+					log.Logf(0, "[+] seeEndFlag reached 2. Exit enrichCorpus loop")
+					break
+				}
 				if *flagRepair {
 					mgr.repairCorpus()
 				}
@@ -369,24 +379,21 @@ func (mgr *Manager) initBackup() {
 			return
 		}
 	}
-	// Parse the duration string
+	// Parse the backup cycle duration string
 	duration, err := time.ParseDuration(*flagBackup)
 	if err != nil {
 		log.Logf(0, "error parsing duration: %v.", err)
 		return
 	}
 	backCnt := 0
+	maxBackDuration := 7 * 24 * time.Hour // 7 days
+	startBackTime := time.Now()
 	go func() {
 		for {
 			time.Sleep(duration)
 			backCnt += 1
 			log.Logf(0, "[+] start the %v-th backup after sleep of duration: %v", backCnt, duration)
 			// add mutex lock for these backup files?
-			// backup corpus
-			srcCorpus := filepath.Join(mgr.cfg.Workdir, "corpus.db")
-			dstCorpus := filepath.Join(backupDir, fmt.Sprintf("corpus.db_%d_%s", backCnt, *flagBackup))
-			osutil.CopyFile(srcCorpus, dstCorpus)
-
 			// backup CoveredCalls
 			srcCoveredCalls := filepath.Join(mgr.cfg.Workdir, "CoveredCalls")
 			dstCoveredCalls := filepath.Join(backupDir, fmt.Sprintf("CoveredCalls_%d_%s", backCnt, *flagBackup))
@@ -401,6 +408,16 @@ func (mgr *Manager) initBackup() {
 				log.Logf(0, "[+] rawcover curl success")
 				osutil.WriteFile(dstRawcover, outBytes)
 			}
+
+			if time.Since(startBackTime) > maxBackDuration {
+				log.Logf(0, "[+] backup duration exceed maxBackDuration, skip backup corpus and crashes in the %v-th backup", backCnt)
+				continue
+			}
+			// backup corpus
+			srcCorpus := filepath.Join(mgr.cfg.Workdir, "corpus.db")
+			dstCorpus := filepath.Join(backupDir, fmt.Sprintf("corpus.db_%d_%s", backCnt, *flagBackup))
+			osutil.CopyFile(srcCorpus, dstCorpus)
+
 			// backup crashes
 			srcCrashDir := filepath.Join(mgr.cfg.Workdir, "crashes")
 			dstCrashDir := filepath.Join(backupDir, fmt.Sprintf("crashes_%d_%s", backCnt, *flagBackup))
