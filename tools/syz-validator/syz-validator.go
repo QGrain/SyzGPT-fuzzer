@@ -82,7 +82,15 @@ func main() {
 		}
 		checkPrograms(target, args[1], outDir)
 	case "debug":
-		debug(target)
+		var outDir string
+		if len(args) == 1 {
+			outDir = "."
+		} else if len(args) == 2 {
+			outDir = args[1]
+		} else {
+			usage()
+		}
+		debug(target, outDir)
 	default:
 		usage()
 	}
@@ -94,7 +102,7 @@ func usage() {
 	fmt.Fprintf(os.Stderr, "usage: syz-validator -os <OS> -arch <ARCH> -log <log_path> [args...]\n")
 	fmt.Fprintf(os.Stderr, "       syz-validator file syzprog\n")
 	fmt.Fprintf(os.Stderr, "       syz-validator dir /dir/to/syzprogs [out_dir]\n")
-	fmt.Fprintf(os.Stderr, "       syz-validator debug\n")
+	fmt.Fprintf(os.Stderr, "       syz-validator debug [out_dir]\n")
 	os.Exit(1)
 }
 
@@ -156,8 +164,21 @@ func checkPrograms(target *prog.Target, dir, outDir string) (badCnt int32) {
 	return badCnt
 }
 
-func debug(target *prog.Target) {
-	f, err := os.OpenFile("debug.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+func debug(target *prog.Target, outDir string) {
+	if outDir != "" {
+		_, err := os.Stat(outDir)
+		if os.IsNotExist(err) {
+			// directory does not exist, create it
+			err = os.MkdirAll(outDir, 0755)
+			if err != nil {
+				log.Printf("[DEBUG] create dir %s error: %v", outDir, err)
+				return
+			}
+		}
+	}
+	debugLogName := "debug.log"
+	debugLogPath := filepath.Join(outDir, debugLogName)
+	f, err := os.OpenFile(debugLogPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -165,9 +186,9 @@ func debug(target *prog.Target) {
 	multiOut := io.MultiWriter(f, os.Stdout)
 	log.SetOutput(multiOut)
 
-	f2, err2 := os.OpenFile("builtin_syscalls", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
-	if err2 != nil {
-		log.Fatal(err2)
+	f2, err := os.OpenFile(filepath.Join(outDir, "builtin_syscalls.txt"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		log.Fatal(err)
 	}
 	defer f2.Close()
 
@@ -195,4 +216,5 @@ func debug(target *prog.Target) {
 		}
 	}
 	log.Printf("Summary: Call Amount = %v, Variant Amount = %v", len(call_map), len(target.Syscalls))
+	fmt.Printf("Write results to %v\n", outDir)
 }
