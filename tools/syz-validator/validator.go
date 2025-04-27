@@ -164,6 +164,7 @@ func checkPrograms(target *prog.Target, dir, outDir string) (badCnt int32) {
 	return badCnt
 }
 
+// extract built-in syscalls
 func debug(target *prog.Target, outDir string) {
 	if outDir != "" {
 		_, err := os.Stat(outDir)

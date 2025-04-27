@@ -65,14 +65,14 @@ var (
 
 // added by SyzGPT
 // Global Map, storing coverage of [origin_prog, reverse_prog]
-var CoverRecord map[string][3]int //cov0_of_origin, cov1_of_reverse, prog_line_num
-var CoverRecordMutex sync.Mutex
-var ExecFailCnt int
+var coverRecord map[string][3]int // cov0_of_origin, cov1_of_reverse, prog_line_num
+var coverRecordMu sync.Mutex
+var execFailCnt int
 
 // end
 
 func main() {
-	CoverRecord = make(map[string][3]int)
+	coverRecord = make(map[string][3]int)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: execprog [flags] file-with-programs-or-corpus.db+\n")
 		flag.PrintDefaults()
@@ -99,6 +99,7 @@ func main() {
 		log.Fatalf("%v", err)
 	}
 	// added by SyzGPT
+	// we consider executing a prog in reverse order as executing each syscall separately
 	var progs []*prog.Prog
 	var reverseProgs []*prog.Prog
 	var filePathList []string
@@ -106,7 +107,7 @@ func main() {
 	var fileNameList []string
 	var reverseFileNameList []string
 	if *flagProgDir != "" {
-		// 从文件夹load文件
+		// load progs from directory
 		files, errdir := os.ReadDir(*flagProgDir)
 		if errdir != nil {
 			log.Fatalf("%v", err)
@@ -120,9 +121,9 @@ func main() {
 					reverseFilePathList = append(reverseFilePathList, filepath.Join(*flagProgDir, file.Name()))
 					reverseFileNameList = append(reverseFileNameList, file.Name())
 					index := strings.LastIndex(file.Name(), ".rev")
-					stripName := file.Name()[:index]
-					fileNameList = append(fileNameList, stripName)
-					filePathList = append(filePathList, filepath.Join(*flagProgDir, stripName))
+					origName := file.Name()[:index]
+					fileNameList = append(fileNameList, origName)
+					filePathList = append(filePathList, filepath.Join(*flagProgDir, origName))
 				}
 			} else {
 				fileNameList = append(fileNameList, file.Name())
@@ -130,7 +131,7 @@ func main() {
 			}
 		}
 	} else {
-		// 从命令行参数读取文件
+		// load progs from command line
 		for _, filePath := range flag.Args() {
 			fileName := filepath.Base(filePath)
 			fileNameList = append(fileNameList, fileName)
@@ -144,12 +145,12 @@ func main() {
 	}
 	progs = loadPrograms(target, filePathList)
 	reverseProgs = loadPrograms(target, reverseFilePathList)
-	// end
 	if len(progs) == 0 && len(reverseProgs) == 0 {
 		return
 	} else {
 		log.Logf(0, "[success] load %d progs and %d rev_progs", len(progs), len(reverseProgs))
 	}
+	// end
 
 	features, err := host.Check(target)
 	if err != nil {
@@ -227,21 +228,21 @@ func main() {
 
 	// added by SyzGPT
 	if *flagSemantic && *flagCoverFile != "" {
-		CoverRecord_OutputFile := fmt.Sprintf("%s_Total_CoverRecord", *flagCoverFile)
-		err := saveToFile(CoverRecord_OutputFile)
+		coverRecordFile := fmt.Sprintf("%s_Evaluation_Results", *flagCoverFile)
+		err := saveToFile(coverRecordFile)
 		if err != nil {
-			log.Logf(0, "Failed to save CoverRecord.")
+			log.Logf(0, "failed to save coverRecord.")
 			log.Fatal(err)
 			return
 		}
 
-		log.Logf(0, "CoverRecord saved successfully.")
+		log.Logf(0, "context effectiveness evaluation results saved to %s", coverRecordFile)
 	}
 	// end
 }
 
 // added by SyzGPT
-// Save CoverRecord to file
+// save coverRecord to file
 func saveToFile(fileName string) error {
 	file, err := os.Create(fileName)
 	if err != nil {
@@ -249,83 +250,93 @@ func saveToFile(fileName string) error {
 	}
 	defer file.Close()
 
-	// general cover info
-	total_cover := 0
-	win_cover := 0
-	equal_cover := 0
-	lose_cover := 0
+	// define the counters
+	// we regard a prog with cover greater than reverse cover as context effective (win)
+	totalProgCnt := 0
+	totalWinCnt := 0
+	totalEqualCnt := 0
+	totalLoseCnt := 0
 
-	//make cover info more specific
-	OneLineProg_total := 0
-	OneLineProg_win := 0
-	OneLineProg_equal := 0
-	OneLineProg_lose := 0
+	// we do take the prog with length of 1 into account, as they have no context
+	oneLineProgCnt := 0
+	oneLineWinCnt := 0
+	oneLineEqualCnt := 0
+	oneLineLoseCnt := 0
 
-	for key, value := range CoverRecord {
+	// write the header
+	line := "Program Name" + "," + "Cover" + "," + "ReverseCover" + "," + "Program Length" + "\n"
+	if _, err := file.WriteString(line); err != nil {
+		return err
+	}
+	for key, value := range coverRecord {
 		cov0 := value[0]
 		cov1 := value[1]
-		lineNum := value[2]
+		progLength := value[2]
 
-		total_cover += 1
-		if lineNum == 1 {
-			OneLineProg_total += 1
+		totalProgCnt += 1
+		if progLength == 1 {
+			oneLineProgCnt += 1
 		}
 		if cov0 > cov1 {
-			win_cover += 1
-			if lineNum == 1 {
-				OneLineProg_win += 1
+			totalWinCnt += 1
+			if progLength == 1 {
+				oneLineWinCnt += 1
 			}
 		} else if cov0 == cov1 {
-			equal_cover += 1
-			if lineNum == 1 {
-				OneLineProg_equal += 1
+			totalEqualCnt += 1
+			if progLength == 1 {
+				oneLineEqualCnt += 1
 			}
 		} else {
-			lose_cover += 1
-			if lineNum == 1 {
-				OneLineProg_lose += 1
+			totalLoseCnt += 1
+			if progLength == 1 {
+				oneLineLoseCnt += 1
 			}
 		}
 
-		line := key + "," + strconv.Itoa(cov0) + "," + strconv.Itoa(cov1) + "," + strconv.Itoa(lineNum) + "\n"
-		_, err := file.WriteString(line)
-		if err != nil {
+		line := key + "," + strconv.Itoa(cov0) + "," + strconv.Itoa(cov1) + "," + strconv.Itoa(progLength) + "\n"
+		if _, err := file.WriteString(line); err != nil {
 			return err
 		}
 	}
-	// win_rate := float64(win_cover) / float64(total_cover)
-	// percentage := win_rate * 100
-	// format_percent := fmt.Sprintf("%.2f%%", percentage)
-	// line := "Win Rate:" + strconv.Itoa(win_cover) + "/" + strconv.Itoa(total_cover) + "=" + format_percent
-	line := "Result info:\n" +
-		"Total Progs: " + strconv.Itoa(total_cover) + "\n" +
-		"Total win: " + strconv.Itoa(win_cover) + "\n" +
-		"Total equal: " + strconv.Itoa(equal_cover) + "\n" +
-		"Total lose: " + strconv.Itoa(lose_cover) + "\n\n" +
-		"One-line Progs:" + strconv.Itoa(OneLineProg_total) + "\n" +
-		"One-line win:" + strconv.Itoa(OneLineProg_win) + "\n" +
-		"One-line equal:" + strconv.Itoa(OneLineProg_equal) + "\n" +
-		"One-line lose:" + strconv.Itoa(OneLineProg_lose) + "\n" +
-		"Execution Fails:" + strconv.Itoa(ExecFailCnt) + "\n"
-	_, err_last := file.WriteString(line)
-	if err_last != nil {
-		return err_last
+
+	// OCER: Overall Context Effectiveness Rate
+	// ECER: Exclusive Context Effectiveness Rate
+	// CER: Context Effectiveness Rate
+	OCER := float64(totalWinCnt) / float64(totalProgCnt) * 100
+	ECER := float64(totalWinCnt-oneLineWinCnt) / float64(totalProgCnt-oneLineWinCnt) * 100
+	CER := float64(totalWinCnt-oneLineWinCnt) / float64(totalProgCnt) * 100
+	line = "\nEvaluation Results of Contextual Effectiveness:\n" +
+		"Execution Fails:" + strconv.Itoa(execFailCnt) + "\n" +
+		"Total Progs: " + strconv.Itoa(totalProgCnt) + "\n" +
+		"Total Win: " + strconv.Itoa(totalWinCnt) + "\n" +
+		"Total Equal: " + strconv.Itoa(totalEqualCnt) + "\n" +
+		"Total Lose: " + strconv.Itoa(totalLoseCnt) + "\n\n" +
+		"One-line Progs:" + strconv.Itoa(oneLineProgCnt) + "\n" +
+		"One-line Win:" + strconv.Itoa(oneLineWinCnt) + "\n" +
+		"One-line Equal:" + strconv.Itoa(oneLineEqualCnt) + "\n" +
+		"One-line Lose:" + strconv.Itoa(oneLineLoseCnt) + "\n\n" +
+		"Overall Context Effective Rate (OCER): " + fmt.Sprintf("%.2f%%", OCER) + "\n" +
+		"Exclusive Context Effective Rate (ECER): " + fmt.Sprintf("%.2f%%", ECER) + "\n" +
+		"Context Effective Rate (CER): " + fmt.Sprintf("%.2f%%", CER) + "\n"
+	if _, err := file.WriteString(line); err != nil {
+		return err
 	}
 	return nil
 }
 
-func setCoverRecord(fileName string, value1, value2, lineNum int) {
-	CoverRecordMutex.Lock()
-	defer CoverRecordMutex.Unlock()
+func setCoverRecord(fileName string, value1, value2, progLength int) {
+	coverRecordMu.Lock()
+	defer coverRecordMu.Unlock()
 
-	CoverRecord[fileName] = [3]int{value1, value2, lineNum}
+	coverRecord[fileName] = [3]int{value1, value2, progLength}
 }
 
 func getCoverRecord(fileName string) (bool, int, int) {
-	CoverRecordMutex.Lock()
-	defer CoverRecordMutex.Unlock()
+	coverRecordMu.Lock()
+	defer coverRecordMu.Unlock()
 
-	values, ok := CoverRecord[fileName]
+	values, ok := coverRecord[fileName]
 	if ok {
 		return ok, values[0], values[1]
 	}
@@ -387,7 +398,7 @@ func (ctx *Context) execute(pid int, env *ipc.Env, p *prog.Prog, progIndex int, 
 				if *flagProgDir != "" {
 					log.Logf(0, "executor failed %v times: %v\n%s", try, err, output)
 					log.Logf(0, "[semantic dump mode] the %d prog failed, skip it", progIndex)
-					ExecFailCnt += 1
+					execFailCnt += 1
 					break
 				} else {
 					log.Fatalf("executor failed %v times: %v\n%s", try, err, output)
@@ -502,9 +513,9 @@ func (ctx *Context) dumpCoverage(coverFile string, info *ipc.ProgInfo, covType i
 	// added by SyzGPT
 	totalMap := make(map[string]int)
 	covNum := 0
-	lineNum := 0
+	progLength := 0
 	for _, inf := range info.Calls {
-		lineNum += 1
+		progLength += 1
 		for _, pc := range inf.Cover {
 			newPC := fmt.Sprintf("0x%x", cover.RestorePC(pc, 0xffffffff))
 			if _, ok := totalMap[newPC]; !ok {
@@ -519,17 +530,17 @@ func (ctx *Context) dumpCoverage(coverFile string, info *ipc.ProgInfo, covType i
 	ok, cov0, cov1 := getCoverRecord(recordKey)
 	if covType == 0 {
 		if ok {
-			log.Logf(0, "Cover map error! Repeated prog. %s", recordKey)
+			log.Logf(0, "cover map error, repeated prog. %s", recordKey)
 		} else {
 			cov0 = covNum
-			setCoverRecord(recordKey, cov0, cov1, lineNum)
+			setCoverRecord(recordKey, cov0, cov1, progLength)
 		}
 	} else {
 		if ok {
 			cov1 = covNum
-			setCoverRecord(recordKey, cov0, cov1, lineNum)
+			setCoverRecord(recordKey, cov0, cov1, progLength)
 		} else {
-			log.Logf(0, "Cover map error! Non-existed origin prog. %s", recordKey)
+			log.Logf(0, "cover map error: non-existed origin prog. %s", recordKey)
 		}
 	}
 
