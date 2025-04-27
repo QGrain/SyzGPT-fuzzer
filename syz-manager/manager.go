@@ -450,7 +450,7 @@ func (mgr *Manager) initBench() {
 			vals["EnabledSyscalls"] = uint64(len(mgr.targetEnabledSyscalls))
 			vals["syscalls"] = uint64(len(gCoverCalls))
 			vals["EnrichCnt"] = uint64(enrichCnt)
-			vals["costT"] = uint64(costT) / 1e6
+			vals["costT"] = uint64(costT) / 1e9
 			mgr.mu.Unlock()
 
 			data, err := json.MarshalIndent(vals, "", "  ")
